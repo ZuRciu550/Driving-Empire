@@ -1575,7 +1575,7 @@ local currentFlightTween = nil
 local noclipConnection = nil
 local currentLoopId = 0
 
--- Uçuşu güvenli bir şekilde durdurmak (Yürümeye geçmeden ve yere basmadan önce)
+-- Uçuşu durdurur, karakterin serbestçe düşmesini sağlar
 local function stopFlight()
 	if currentFlightTween then
 		currentFlightTween:Cancel()
@@ -1593,7 +1593,7 @@ local function stopFlight()
 	end
 end
 
--- Hızı ayarlanabilir, Noclip açık uçuş
+-- Aşırı Hızlı Uçuş (Noclip Açık)
 local function flyToPos(targetPos, speed)
 	local char = LocalPlayer.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -1607,7 +1607,7 @@ local function flyToPos(targetPos, speed)
 
 	hrp.Anchored = true
 
-	-- Uçarken binalara takılmamak için Noclip
+	-- Uçarken binalara takılmamak için sürekli Noclip
 	if not noclipConnection then
 		noclipConnection = RunService.Stepped:Connect(function()
 			if LocalPlayer.Character then
@@ -1628,7 +1628,7 @@ local function flyToPos(targetPos, speed)
 	hrp.Velocity = Vector3.zero
 end
 
--- NPC veya sabit noktalar için 10 stud uzağı ve 10 stud yukarısını hesaplar
+-- NPC veya sabit noktalar için yaklaşma hesaplaması
 local function getApproachPos(hrpPos, targetPos, distance)
 	local offset = Vector3.new(hrpPos.X - targetPos.X, 0, hrpPos.Z - targetPos.Z)
 	if offset.Magnitude < 0.1 then 
@@ -1636,11 +1636,10 @@ local function getApproachPos(hrpPos, targetPos, distance)
 	else
 		offset = offset.Unit * distance
 	end
-	-- Yükseklik 10 olarak ayarlandı (Yürümeden önce 10 stud yukardan gelir)
 	return Vector3.new(targetPos.X + offset.X, targetPos.Y + 10, targetPos.Z + offset.Z)
 end
 
--- Hitbox modelinin köşesini ve 10 stud yukarısını hesaplar
+-- Hitbox modelinin köşesini hesaplaması
 local function getModelEdgeApproachPos(hrpPos, model)
 	local cf, size = model:GetBoundingBox()
 	local center = cf.Position
@@ -1655,21 +1654,61 @@ local function getModelEdgeApproachPos(hrpPos, model)
 	local radius = math.max(size.X, size.Z) / 2
 	local approachPos = center - (dir * (radius + 10))
 	
-	-- Yükseklik 10 olarak ayarlandı (Yürümeden önce 10 stud yukardan gelir)
 	return Vector3.new(approachPos.X, center.Y + 10, approachPos.Z), center
 end
 
--- Doğal Yürüme Fonksiyonu
+-- AKILLI YÜRÜYÜŞ SİSTEMİ (Önünde duvar varsa Noclip açar, çıkınca kapatır)
 local function walkToPos(targetPos, loopId)
 	local char = LocalPlayer.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
 	if not hrp or not humanoid then return end
 
-	humanoid:MoveTo(targetPos)
+	-- Sadece Noclip açıldığında düşmemesi için Y eksenini kilitleyen mekanizma
+	local antiFall = Instance.new("BodyPosition")
+	antiFall.MaxForce = Vector3.new(0, 0, 0) -- Başlangıçta kapalı (normal fizik)
+	antiFall.Position = Vector3.new(0, targetPos.Y, 0)
+	antiFall.P = 100000
+	antiFall.D = 500
+	antiFall.Parent = hrp
+
+	-- Her karede önünü tarayan ve yürümeyi sağlayan döngü
+	local walkConn = RunService.Stepped:Connect(function()
+		if not hrp or not humanoid then return end
+
+		-- Karakterin hedefe doğru gidiş yönünü hesapla
+		local flatDir = Vector3.new(targetPos.X - hrp.Position.X, 0, targetPos.Z - hrp.Position.Z)
+		if flatDir.Magnitude > 0.1 then flatDir = flatDir.Unit else flatDir = hrp.CFrame.LookVector end
+		
+		-- Karakterin 3 stud gerisinden, ileriye 7 studluk bir lazer (Raycast) at
+		local rayOrigin = hrp.Position - (flatDir * 3)
+		local rayDir = flatDir * 7
+
+		local params = RaycastParams.new()
+		params.FilterDescendantsInstances = {char}
+		params.FilterType = Enum.RaycastFilterType.Exclude
+
+		local hit = workspace:Raycast(rayOrigin, rayDir, params)
+
+		-- Önümüzde veya içimizde bir duvar varsa (hit gerçekleşirse)
+		if hit and hit.Instance.CanCollide then
+			-- Anında Noclip'i aç
+			for _, p in ipairs(char:GetDescendants()) do
+				if p:IsA("BasePart") then p.CanCollide = false end
+			end
+			-- Yerin altına düşmemesi için kilidi devreye sok (Hedefin yüksekliğinde kayar)
+			antiFall.MaxForce = Vector3.new(0, 100000, 0)
+		else
+			-- Önü boşsa normal fiziklere dön
+			antiFall.MaxForce = Vector3.new(0, 0, 0)
+		end
+		
+		-- Yürümeyi sürekli tetikle
+		humanoid:MoveTo(targetPos)
+	end)
 	
 	local timeout = 0
-	-- Hedefe girene kadar bekle
+	-- Hedefe 4 stud yaklaşana kadar bekle
 	while timeout < 50 do
 		if currentLoopId ~= loopId or not autoDelivery then break end
 		
@@ -1679,6 +1718,10 @@ local function walkToPos(targetPos, loopId)
 		task.wait(0.1)
 		timeout = timeout + 1
 	end
+
+	-- İşlem bitince taramayı ve kilitleri temizle
+	if walkConn then walkConn:Disconnect() end
+	if antiFall then antiFall:Destroy() end
 end
 
 DeliveryTab:CreateSection("Teslimat Ayarları")
@@ -1716,10 +1759,11 @@ DeliveryTab:CreateToggle({
 						flyToPos(approachPos, 2000) 
 						if currentLoopId ~= thisLoopId then break end
 						
+						-- Uçmayı bırak, 10 studdan yere güvenle düşsün
 						stopFlight() 
-						task.wait(0.4) -- 10 studdan yere düşmesi için bekleme payı
+						task.wait(0.4) 
 						
-						-- Son 10 studu yürüyerek git
+						-- Akıllı sistem ile son 10 studu yürü
 						walkToPos(startPos, thisLoopId)
 						if currentLoopId ~= thisLoopId then break end
 
@@ -1785,21 +1829,22 @@ DeliveryTab:CreateToggle({
 						end
 						
 						if effectModel then
-							-- Hitbox'ın sınırından 10 stud uzağı ve 10 stud yukarısını hesapla
+							-- Hitbox sınırından 10 stud uzağı ve 10 stud yukarısını al
 							local edgeApproachPos, centerPos = getModelEdgeApproachPos(hrp.Position, effectModel)
 							
 							-- Hesaplanan noktaya uç (Hız: 2000)
 							flyToPos(edgeApproachPos, 2000)
 							if currentLoopId ~= thisLoopId then break end
 							
-							stopFlight() -- Serbest bırak
-							task.wait(0.4) -- 10 stud yukardan yere düşmesini bekle
+							-- Serbest bırak, yere güvenle düşsün
+							stopFlight() 
+							task.wait(0.4) 
 							
-							-- Hitbox'ın merkezine yürü
+							-- Akıllı sistem ile hitbox'ın tam merkezine yürü
 							walkToPos(centerPos, thisLoopId)
 							if currentLoopId ~= thisLoopId then break end
 							
-							-- İstenen bekleme süreleri (Toplayan: 6, Veren: 0.3)
+							-- Bekleme süreleri
 							if deliveryTag == "Toplayan" then
 								task.wait(6)
 								deliveryTag = "Veren"
@@ -1813,6 +1858,9 @@ DeliveryTab:CreateToggle({
 					end
 				end
 			end)
+		else
+			-- Kapatıldığında her şeyi tamamen durdur
+			stopFlight()
 		end
 	end,
 })
